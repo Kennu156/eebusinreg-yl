@@ -3,3 +3,4 @@ registry.duckdb.wal
 *.zip
 __pycache__/
 *.pyc
+tartu_active.csv
