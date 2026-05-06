@@ -1,0 +1,5 @@
+registry.duckdb
+registry.duckdb.wal
+*.zip
+__pycache__/
+*.pyc
