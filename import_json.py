@@ -13,22 +13,43 @@ Tables created:
 
 Run:
     python3 import_json.py
+
+Speed tips:
+    Install the yajl C library for a 3-5x parsing boost:
+        sudo apt install libyajl2   # Debian/Ubuntu
+        pip install ijson[yajl2_c]  # or just: pip install ijson
+    The script auto-selects the fastest available ijson backend.
 """
 
+import importlib
 import os
 import time
 import zipfile
-import ijson
+from datetime import datetime
+
 import duckdb
+import ijson
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
+from rich.progress import MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
+# Auto-select fastest available ijson backend (yajl2_c > yajl2_cffi > yajl2 > python)
+_ijson_items = ijson.items
+_ijson_backend = "python"
+for _b in ("yajl2_c", "yajl2_cffi", "yajl2"):
+    try:
+        _mod = importlib.import_module(f"ijson.backends.{_b}")
+        _ijson_items = _mod.items
+        _ijson_backend = _b
+        break
+    except (ImportError, AttributeError):
+        pass
 
 console = Console()
 DB_PATH = os.environ.get("REGISTRY_DB", "registry.duckdb")
 ZIP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ettevotja_rekvisiidid__yldandmed.json.zip")
 JSON_NAME = "ettevotja_rekvisiidid__yldandmed.json"
 
-BATCH_SIZE = 500  # rows per insert batch
+BATCH_SIZE = 5000
 
 DDL = """
 CREATE TABLE IF NOT EXISTS companies_detail (
@@ -90,22 +111,29 @@ CREATE TABLE IF NOT EXISTS annual_reports (
 );
 """
 
+_TABLES = ("companies_detail", "contacts", "activities", "capitals", "annual_reports")
+
+_INS_DETAIL   = "INSERT INTO companies_detail VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+_INS_CONTACT  = "INSERT INTO contacts VALUES (?,?,?,?,?,?)"
+_INS_ACTIVITY = "INSERT INTO activities VALUES (?,?,?,?,?,?,?,?)"
+_INS_CAPITAL  = "INSERT INTO capitals VALUES (?,?,?,?,?,?)"
+_INS_REPORT   = "INSERT INTO annual_reports VALUES (?,?,?,?,?,?,?)"
+
 
 def parse_date(s):
     if not s:
         return None
     try:
-        from datetime import datetime
         return datetime.strptime(s, "%d.%m.%Y").date().isoformat()
     except Exception:
         return None
 
 
-def safe_decimal(s):
-    if s is None:
+def safe_decimal(v):
+    if v is None:
         return None
     try:
-        return float(str(s).replace(",", "."))
+        return float(v) if not isinstance(v, str) else float(v.replace(",", "."))
     except Exception:
         return None
 
@@ -119,47 +147,42 @@ def safe_int(s):
         return None
 
 
-def executemany_safe(con, sql, rows):
-    if rows:
-        con.executemany(sql, rows)
-
-
 def import_json(zip_path=ZIP_PATH, db_path=DB_PATH):
     if not os.path.exists(zip_path):
         console.print(f"[red]ZIP not found:[/red] {zip_path}")
         return
 
-    console.print(f"[bold]Database:[/bold] {db_path}")
-    console.print(f"[bold]Source:[/bold] {zip_path}")
+    console.print(f"[bold]Database     :[/bold] {db_path}")
+    console.print(f"[bold]Source       :[/bold] {zip_path}")
+    console.print(f"[bold]ijson backend:[/bold] {_ijson_backend}")
     console.print()
 
     con = duckdb.connect(db_path)
+    # Drop and recreate — faster than DELETE and avoids WAL recovery overhead
+    # from any previously killed run.
+    for tbl in _TABLES:
+        con.execute(f"DROP TABLE IF EXISTS {tbl}")
     con.execute(DDL)
 
-    # Drop existing data for idempotency
-    for tbl in ("companies_detail", "contacts", "activities", "capitals", "annual_reports"):
-        con.execute(f"DELETE FROM {tbl}")
-
-    # Prepared INSERT statements
-    ins_detail = """
-        INSERT OR REPLACE INTO companies_detail VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """
-    ins_contact = "INSERT OR REPLACE INTO contacts VALUES (?,?,?,?,?,?)"
-    ins_activity = "INSERT OR REPLACE INTO activities VALUES (?,?,?,?,?,?,?,?)"
-    ins_capital = "INSERT OR REPLACE INTO capitals VALUES (?,?,?,?,?,?)"
-    ins_report = "INSERT OR REPLACE INTO annual_reports VALUES (?,?,?,?,?,?,?)"
-
-    # Batches
     b_detail, b_contact, b_activity, b_capital, b_report = [], [], [], [], []
 
+    def _insert(label, sql, rows):
+        if not rows:
+            return
+        t0 = time.time()
+        print(f"  {label}: {len(rows):,} rows ... ", end="", flush=True)
+        con.executemany(sql, rows)
+        print(f"{time.time() - t0:.2f}s")
+        rows.clear()
+
     def flush():
-        executemany_safe(con, ins_detail, b_detail)
-        executemany_safe(con, ins_contact, b_contact)
-        executemany_safe(con, ins_activity, b_activity)
-        executemany_safe(con, ins_capital, b_capital)
-        executemany_safe(con, ins_report, b_report)
-        b_detail.clear(); b_contact.clear(); b_activity.clear()
-        b_capital.clear(); b_report.clear()
+        con.begin()
+        _insert("companies", _INS_DETAIL,   b_detail)
+        _insert("contacts",  _INS_CONTACT,  b_contact)
+        _insert("activities",_INS_ACTIVITY, b_activity)
+        _insert("capitals",  _INS_CAPITAL,  b_capital)
+        _insert("reports",   _INS_REPORT,   b_report)
+        con.commit()
 
     start = time.time()
     count = 0
@@ -175,7 +198,7 @@ def import_json(zip_path=ZIP_PATH, db_path=DB_PATH):
 
         with zipfile.ZipFile(zip_path) as zf:
             with zf.open(JSON_NAME) as f:
-                for rec in ijson.items(f, "item"):
+                for rec in _ijson_items(f, "item"):
                     code = str(rec["ariregistri_kood"])
                     nimi = rec.get("nimi")
                     yl = rec.get("yldandmed", {})
@@ -203,9 +226,9 @@ def import_json(zip_path=ZIP_PATH, db_path=DB_PATH):
                     # ── contacts ─────────────────────────────────────────
                     for c in yl.get("sidevahendid", []):
                         kid = c.get("kirje_id")
-                        if kid:
+                        if kid is not None:
                             b_contact.append((
-                                kid, code,
+                                int(kid), code,
                                 c.get("liik"),
                                 c.get("liik_tekstina"),
                                 c.get("sisu"),
@@ -215,9 +238,9 @@ def import_json(zip_path=ZIP_PATH, db_path=DB_PATH):
                     # ── activities ───────────────────────────────────────
                     for a in yl.get("teatatud_tegevusalad", []):
                         kid = a.get("kirje_id")
-                        if kid:
+                        if kid is not None:
                             b_activity.append((
-                                kid, code,
+                                int(kid), code,
                                 a.get("emtak_kood"),
                                 a.get("emtak_tekstina"),
                                 a.get("nace_kood"),
@@ -229,9 +252,9 @@ def import_json(zip_path=ZIP_PATH, db_path=DB_PATH):
                     # ── capitals ─────────────────────────────────────────
                     for k in yl.get("kapitalid", []):
                         kid = k.get("kirje_id")
-                        if kid:
+                        if kid is not None:
                             b_capital.append((
-                                kid, code,
+                                int(kid), code,
                                 safe_decimal(k.get("kapitali_suurus")),
                                 k.get("kapitali_valuuta"),
                                 parse_date(k.get("algus_kpv")),
@@ -241,9 +264,9 @@ def import_json(zip_path=ZIP_PATH, db_path=DB_PATH):
                     # ── annual reports ───────────────────────────────────
                     for r in yl.get("info_majandusaasta_aruannetest", []):
                         kid = r.get("kirje_id")
-                        if kid:
+                        if kid is not None:
                             b_report.append((
-                                kid, code,
+                                int(kid), code,
                                 parse_date(r.get("majandusaasta_perioodi_algus_kpv")),
                                 parse_date(r.get("majandusaasta_perioodi_lopp_kpv")),
                                 safe_int(r.get("tootajate_arv")),
@@ -252,15 +275,14 @@ def import_json(zip_path=ZIP_PATH, db_path=DB_PATH):
                             ))
 
                     count += 1
+                    progress.advance(task)
                     if count % BATCH_SIZE == 0:
                         flush()
-                        progress.update(task, completed=count, description=f"Importing records… {count:,}")
 
-        flush()  # final batch
+        flush()  # final partial batch
 
     elapsed = time.time() - start
 
-    # Row counts
     def rc(tbl):
         return con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
 
@@ -272,7 +294,7 @@ def import_json(zip_path=ZIP_PATH, db_path=DB_PATH):
     console.print(f"  Capital records  : [bold]{rc('capitals'):,}[/bold]")
     console.print(f"  Annual reports   : [bold]{rc('annual_reports'):,}[/bold]")
     console.print(f"  Time elapsed     : [bold]{elapsed:.1f}s[/bold]")
-    console.print(f"  Throughput       : [bold]{int(count/elapsed):,} records/sec[/bold]")
+    console.print(f"  Throughput       : [bold]{int(count / elapsed):,} records/sec[/bold]")
 
     con.close()
 

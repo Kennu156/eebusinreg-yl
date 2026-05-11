@@ -1,3 +1,4 @@
+.venv/
 registry.duckdb
 registry.duckdb.wal
 *.zip
